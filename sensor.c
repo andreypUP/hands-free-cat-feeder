@@ -23,6 +23,9 @@ volatile uint16_t pulse_end = 0;
 volatile uint16_t pulse_width = 0;
 volatile uint8_t measurement_complete = 0;
 
+// External callback function (defined in main.c)
+extern void sensor_measurement_complete_callback(uint16_t distance_cm);
+
 // Pin Change Interrupt for Echo pin (PD6 - PCINT22)
 ISR(PCINT2_vect) {
     uint8_t echo_state = gpio_read(SENSOR_ECHO_PORT, SENSOR_ECHO_PIN);
@@ -43,11 +46,17 @@ ISR(PCINT2_vect) {
             pulse_width = (0xFFFF - pulse_start) + pulse_end;
         }
         
-        sensor_state = SENSOR_COMPLETE;
+        // Calculate distance: pulse_width / 116 (each tick is 0.5us)
+        uint16_t distance_cm = pulse_width / 116;
+        
+        sensor_state = SENSOR_IDLE;  // Ready for next measurement
         measurement_complete = 1;
         
         // Disable pin change interrupt until next trigger
         PCICR &= ~(1 << PCIE2);
+        
+        // Notify main.c via callback
+        sensor_measurement_complete_callback(distance_cm);
     }
 }
 
@@ -59,6 +68,9 @@ ISR(TIMER1_OVF_vect) {
         pulse_width = 0;
         measurement_complete = 1;
         PCICR &= ~(1 << PCIE2);
+        
+        // Notify with 0 distance (timeout/error)
+        sensor_measurement_complete_callback(0);
     }
 }
 
@@ -75,8 +87,7 @@ void sensor_init(void) {
     TIMSK1 = (1 << TOIE1); // Enable overflow interrupt for timeout
     
     // Setup Pin Change Interrupt for Echo pin (PD6 = PCINT22)
-    PCMSK2 = (1 << PCINT22); // Enable PCINT22
-    // PCICR will be enabled when we trigger
+    PCMSK2 = (1 << PCINT22);
 }
 
 void sensor_trigger(void) {
@@ -92,8 +103,8 @@ void sensor_trigger(void) {
     TCNT1 = 0;
     
     // Enable pin change interrupt
-    PCIFR = (1 << PCIF2); // Clear any pending interrupt
-    PCICR |= (1 << PCIE2); // Enable PCINT[23:16]
+    PCIFR = (1 << PCIF2);
+    PCICR |= (1 << PCIE2);
     
     // Send trigger pulse (10us)
     gpio_write(SENSOR_TRIG_PORT, SENSOR_TRIG_PIN, GPIO_PIN_HIGH);
@@ -110,15 +121,11 @@ uint16_t sensor_get_pulse_width(void) {
 }
 
 uint16_t sensor_get_distance_cm(void) {
-    // Each timer tick is 0.5us
-    // Distance (cm) = (pulse_width * 0.5us * 34300cm/s) / 2
-    // Distance (cm) = pulse_width / 116
     if (pulse_width == 0) return 0;
     return pulse_width / 116;
 }
 
 void sensor_reset(void) {
-    // Reset sensor state to IDLE so it can be triggered again
     sensor_state = SENSOR_IDLE;
     measurement_complete = 0;
 }

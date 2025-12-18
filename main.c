@@ -10,10 +10,10 @@
 // ======================== FEATURE ENABLE/DISABLE ============================
 // ============================================================================
 
-#define ENABLE_UART_DEBUG 1     // Set to 1 for debugging sensor
-#define ENABLE_RTC 1            // Set to 0 to disable RTC time display
-#define ENABLE_SCHEDULED_FEED 1 // Set to 0 to disable scheduled feeding
-#define ENABLE_SENSOR_FEED 1    // Set to 0 to disable sensor-based feeding
+#define ENABLE_UART_DEBUG 1
+#define ENABLE_RTC 1
+#define ENABLE_SCHEDULED_FEED 1
+#define ENABLE_SENSOR_FEED 1
 
 // ============================================================================
 // ============================= CONFIGURATION ================================
@@ -21,13 +21,10 @@
 
 #define SCHEDULE_1_HOUR 6
 #define SCHEDULE_1_MINUTE 0
-
-#define SCHEDULE_2_HOUR 12
-#define SCHEDULE_2_MINUTE 54
-
+#define SCHEDULE_2_HOUR 13
+#define SCHEDULE_2_MINUTE 11
 #define SCHEDULE_3_HOUR 18
 #define SCHEDULE_3_MINUTE 0
-
 #define SCHEDULE_4_HOUR 0
 #define SCHEDULE_4_MINUTE 0
 
@@ -37,7 +34,7 @@
 #define SENSOR_COOLDOWN_MS 3000
 #define SENSOR_CHECK_INTERVAL_MS 500
 #define RTC_CHECK_INTERVAL_MS 1000
-#define RTC_SYNC_INTERVAL_MS 600000  // Sync with hardware RTC every 10 minutes
+#define RTC_SYNC_INTERVAL_MS 600000
 
 // ============================================================================
 // ========================== CONDITIONAL INCLUDES ============================
@@ -62,11 +59,10 @@
 #define SECONDS_TO_TICKS(s) ((s) * 100)
 
 #define SENSOR_COOLDOWN_TICKS MS_TO_TICKS(SENSOR_COOLDOWN_MS)
-#define SCHEDULED_DISPENSE_TICKS SECONDS_TO_TICKS(SCHEDULED_DISPENSE_SECONDS)
-#define SENSOR_DISPENSE_TICKS SECONDS_TO_TICKS(SENSOR_DISPENSE_SECONDS)
 #define SENSOR_CHECK_TICKS MS_TO_TICKS(SENSOR_CHECK_INTERVAL_MS)
 #define RTC_CHECK_TICKS MS_TO_TICKS(RTC_CHECK_INTERVAL_MS)
 #define RTC_SYNC_TICKS MS_TO_TICKS(RTC_SYNC_INTERVAL_MS)
+#define CAT_CONFIRMATION_TICKS 100  // 1 second
 
 typedef enum
 {
@@ -82,28 +78,49 @@ typedef enum
 
 volatile CatFeederState state = IDLE;
 volatile uint32_t system_ticks = 0;
-volatile uint8_t measurement_request = 0;
+
+// Event flags from ISRs
+volatile uint8_t sensor_measurement_ready = 0;
+volatile uint8_t motor_dispense_complete = 0;
 volatile uint8_t rtc_display_request = 0;
 volatile uint8_t rtc_sync_request = 0;
+volatile uint8_t schedule_dispense_trigger = 0;
 
-// Software RTC maintained in ISR
+// Sensor data
+volatile uint16_t latest_distance_cm = 0;
+
+// Software RTC
 volatile uint8_t soft_rtc_hours = 0;
 volatile uint8_t soft_rtc_minutes = 0;
 volatile uint8_t soft_rtc_seconds = 0;
 
-// Schedule flags and trigger
+// Schedule flags
 volatile uint8_t scheduled_dispense_done_flags = 0;
-volatile uint8_t schedule_dispense_trigger = 0;  // ISR sets this to trigger dispensing
 
-uint32_t sensor_cooldown_start = 0;
-uint32_t dispense_start = 0;
-uint32_t cat_detected_start = 0;
+// Timing variables
+volatile uint32_t sensor_cooldown_end_tick = 0;
+volatile uint32_t cat_detected_tick = 0;
 
-#if ENABLE_SENSOR_FEED
-// Sensor measurement state
-uint8_t sensor_triggered = 0;
-uint32_t sensor_trigger_time = 0;
-#endif
+// ============================================================================
+// ======================== MOTOR COMPLETION CALLBACK =========================
+// ============================================================================
+
+// This function is called from motor.c Timer2 ISR when dispensing completes
+void motor_dispense_complete_callback(void)
+{
+    motor_dispense_complete = 1;
+}
+
+// ============================================================================
+// ======================= SENSOR MEASUREMENT CALLBACK ========================
+// ============================================================================
+
+// This function is called from sensor.c PCINT ISR when measurement completes
+void sensor_measurement_complete_callback(uint16_t distance_cm)
+{
+    latest_distance_cm = distance_cm;
+    sensor_measurement_ready = 1;
+}
 
 // ============================================================================
 // ========================= INTERRUPT SERVICE ROUTINE ========================
@@ -111,7 +128,6 @@ uint32_t sensor_trigger_time = 0;
 
 #if ENABLE_SCHEDULED_FEED
 
-// Helper function to check if current time matches schedule (inline for speed)
 static inline uint8_t is_scheduled_time_isr(uint8_t hour, uint8_t minute)
 {
     return ((hour == SCHEDULE_1_HOUR && minute == SCHEDULE_1_MINUTE) ||
@@ -120,7 +136,6 @@ static inline uint8_t is_scheduled_time_isr(uint8_t hour, uint8_t minute)
             (hour == SCHEDULE_4_HOUR && minute == SCHEDULE_4_MINUTE));
 }
 
-// Helper function to get schedule flag (inline for speed)
 static inline uint8_t get_schedule_flag_isr(uint8_t hour, uint8_t minute)
 {
     if (hour == SCHEDULE_1_HOUR && minute == SCHEDULE_1_MINUTE)
@@ -134,16 +149,21 @@ static inline uint8_t get_schedule_flag_isr(uint8_t hour, uint8_t minute)
     return 0x00;
 }
 
-#endif // ENABLE_SCHEDULED_FEED
+#endif
 
 ISR(TIMER0_COMPA_vect)
 {
     system_ticks++;
 
 #if ENABLE_SENSOR_FEED
+    // Trigger sensor measurement automatically every 500ms
     if (system_ticks % SENSOR_CHECK_TICKS == 0)
     {
-        measurement_request = 1;
+        // Only trigger if in IDLE or CAT_DETECTED state
+        if (state == IDLE || state == CAT_DETECTED)
+        {
+            sensor_trigger();  // Sensor is interrupt-driven, will callback when done
+        }
     }
 #endif
 
@@ -151,9 +171,8 @@ ISR(TIMER0_COMPA_vect)
     // Update software RTC every second
     if (system_ticks % RTC_CHECK_TICKS == 0)
     {
-        rtc_display_request = 1;  // Request LCD update in main loop
+        rtc_display_request = 1;
         
-        // Increment software RTC
         soft_rtc_seconds++;
         if (soft_rtc_seconds >= 60)
         {
@@ -171,7 +190,6 @@ ISR(TIMER0_COMPA_vect)
                 }
                 
 #if ENABLE_SCHEDULED_FEED
-                // Reset schedule flags at 1:00 AM
                 if (soft_rtc_hours == 1 && soft_rtc_minutes == 0)
                 {
                     scheduled_dispense_done_flags = 0;
@@ -180,39 +198,42 @@ ISR(TIMER0_COMPA_vect)
             }
             
 #if ENABLE_SCHEDULED_FEED
-            // Check for scheduled feeding time (at top of minute, seconds == 0)
             if (soft_rtc_seconds == 0 && 
                 is_scheduled_time_isr(soft_rtc_hours, soft_rtc_minutes))
             {
                 uint8_t flag = get_schedule_flag_isr(soft_rtc_hours, soft_rtc_minutes);
                 
-                // Check if not already dispensed and system is idle
                 if (!(scheduled_dispense_done_flags & flag) && state == IDLE)
                 {
                     scheduled_dispense_done_flags |= flag;
-                    schedule_dispense_trigger = 1;  // Signal main loop to start dispensing
+                    schedule_dispense_trigger = 1;
                 }
             }
-#endif // ENABLE_SCHEDULED_FEED
+#endif
         }
     }
     
-    // Request hardware RTC sync every 10 minutes
     if (system_ticks % RTC_SYNC_TICKS == 0)
     {
         rtc_sync_request = 1;
     }
-#endif // ENABLE_RTC
+#endif
+
+    // Check cat detection timeout
+    if (state == CAT_DETECTED)
+    {
+        if ((system_ticks - cat_detected_tick) >= CAT_CONFIRMATION_TICKS)
+        {
+            // Cat confirmed for 1 second, trigger snack dispense
+            state = DISPENSING_SENSOR;
+            motor_start_dispensing(SENSOR_DISPENSE_SECONDS * 1000);
+        }
+    }
 }
 
 // ============================================================================
 // ========================== UTILITY FUNCTIONS ===============================
 // ============================================================================
-
-uint32_t get_elapsed_ticks(uint32_t start_tick)
-{
-    return system_ticks - start_tick;
-}
 
 void timer0_init(void)
 {
@@ -229,13 +250,12 @@ void timer0_init(void)
 #if ENABLE_RTC
 void lcd_display_time_from_soft_rtc(void)
 {
-    // Safely read volatile variables
     uint8_t hours, minutes, seconds;
-    cli();  // Disable interrupts for atomic read
+    cli();
     hours = soft_rtc_hours;
     minutes = soft_rtc_minutes;
     seconds = soft_rtc_seconds;
-    sei();  // Re-enable interrupts
+    sei();
     
     lcd_set_cursor(0, 0);
 
@@ -296,7 +316,6 @@ void lcd_display_state(CatFeederState current_state, uint16_t distance, uint8_t 
 
 #if ENABLE_RTC
 
-// Compile-time macros to extract date/time from __DATE__ and __TIME__
 #define COMPILE_YEAR ((__DATE__[9] - '0') * 10 + (__DATE__[10] - '0'))
 #define COMPILE_MONTH (                                 \
     __DATE__[2] == 'n'   ? (__DATE__[1] == 'a' ? 1 : 6) \
@@ -328,15 +347,13 @@ void auto_set_rtc_time(void)
     compile_time.day = 1;
 
     rtc_set_time(&compile_time);
+    _delay_ms(100);
     
-    _delay_ms(100); // Give RTC time to stabilize
-    
-    // Initialize software RTC with same time
-    cli();  // Disable interrupts for atomic write
+    cli();
     soft_rtc_hours = compile_time.hours;
     soft_rtc_minutes = compile_time.minutes;
     soft_rtc_seconds = compile_time.seconds;
-    sei();  // Re-enable interrupts
+    sei();
 
 #if ENABLE_UART_DEBUG
     uart_println("RTC set to compile time:");
@@ -368,12 +385,11 @@ void sync_soft_rtc_with_hardware(void)
     
     if (rtc_get_time(&hw_time) == 0)
     {
-        // Update software RTC with hardware RTC time
-        cli();  // Disable interrupts for atomic write
+        cli();
         soft_rtc_hours = hw_time.hours;
         soft_rtc_minutes = hw_time.minutes;
         soft_rtc_seconds = hw_time.seconds;
-        sei();  // Re-enable interrupts
+        sei();
         
         DEBUG_PRINTLN("Software RTC synced with hardware");
     }
@@ -383,7 +399,7 @@ void sync_soft_rtc_with_hardware(void)
     }
 }
 
-#endif // ENABLE_RTC
+#endif
 
 // ============================================================================
 // ================================ MAIN FUNCTION =============================
@@ -413,40 +429,35 @@ int main(void)
     // ========== WELCOME SCREEN ==========
     lcd_clear();
     lcd_set_cursor(0, 0);
-    lcd_print("Cat Feeder v2.0");
+    lcd_print("Cat Feeder v3.0");
     lcd_set_cursor(1, 0);
-    lcd_print("Starting...");
+    lcd_print("Fully Interrupt!");
     _delay_ms(1500);
 
-    DEBUG_PRINTLN("=== Cat Feeder v2.0 ===");
-    DEBUG_PRINTLN("Interrupt-Driven Schedule");
+    DEBUG_PRINTLN("=== Cat Feeder v3.0 ===");
+    DEBUG_PRINTLN("FULLY INTERRUPT-DRIVEN");
 
 #if ENABLE_RTC
     auto_set_rtc_time();
 #endif
 
     DEBUG_PRINTLN("System ready!");
-    DEBUG_PRINTLN("Sensor enabled!");
     DEBUG_PRINTLN("=======================");
 
     // ========== VARIABLE DECLARATIONS ==========
-#if ENABLE_SENSOR_FEED
-    uint16_t pulse_width = 0;
-    uint16_t distance_cm = 0;
-#endif
-
     CatFeederState last_state = IDLE;
     uint8_t last_cooldown_status = 0xFF;
+    uint16_t display_distance = 0;
 
     lcd_clear();
 
     // ============================================================================
-    // ============================== MAIN LOOP ===================================
+    // ===================== MAIN LOOP - EVENT DRIVEN ONLY ========================
     // ============================================================================
 
     while (1)
     {
-        // ========== RTC DISPLAY UPDATE ==========
+        // ========== RTC DISPLAY UPDATE (from ISR) ==========
 #if ENABLE_RTC
         if (rtc_display_request)
         {
@@ -454,170 +465,99 @@ int main(void)
             lcd_display_time_from_soft_rtc();
         }
         
-        // ========== RTC HARDWARE SYNC ==========
         if (rtc_sync_request)
         {
             rtc_sync_request = 0;
             sync_soft_rtc_with_hardware();
         }
-#endif // ENABLE_RTC
+#endif
 
-        // ========== SCHEDULED DISPENSE TRIGGER (FROM ISR) ==========
+        // ========== SCHEDULED DISPENSE (from ISR) ==========
 #if ENABLE_SCHEDULED_FEED
         if (schedule_dispense_trigger && state == IDLE)
         {
-            schedule_dispense_trigger = 0;  // Clear trigger flag
+            schedule_dispense_trigger = 0;
             
-            DEBUG_PRINTLN("Scheduled feeding triggered by ISR!");
+            DEBUG_PRINTLN("Scheduled feeding triggered!");
             
             state = DISPENSING_SCHEDULED;
-            dispense_start = system_ticks;
+            motor_start_dispensing(SCHEDULED_DISPENSE_SECONDS * 1000);
         }
-#endif // ENABLE_SCHEDULED_FEED
+#endif
 
-        // ========== ULTRASONIC SENSOR CHECK ==========
+        // ========== SENSOR MEASUREMENT READY (from ISR callback) ==========
 #if ENABLE_SENSOR_FEED
-        if (measurement_request && (state == IDLE || state == CAT_DETECTED))
+        if (sensor_measurement_ready)
         {
-            measurement_request = 0;
+            sensor_measurement_ready = 0;
             
-            // If we haven't triggered yet, trigger the sensor
-            if (!sensor_triggered)
+            uint16_t distance_cm = latest_distance_cm;
+            display_distance = distance_cm;
+            
+            DEBUG_PRINT("Distance: ");
+            DEBUG_PRINT_NUM(distance_cm);
+            DEBUG_PRINTLN(" cm");
+            
+            // Cat detection logic
+            if (distance_cm > 0 && distance_cm < SENSOR_DETECTION_DISTANCE_CM)
             {
-                sensor_trigger();
-                sensor_triggered = 1;
-                sensor_trigger_time = system_ticks;
-                DEBUG_PRINTLN("Sensor triggered");
-            }
-            // If we triggered, wait at least 3 ticks (~30ms) then check if measurement is complete
-            else if (get_elapsed_ticks(sensor_trigger_time) >= 3)
-            {
-                // Check if measurement completed
-                if (sensor_is_measurement_complete())
+                // Check if cooldown expired
+                if (system_ticks >= sensor_cooldown_end_tick)
                 {
-                    pulse_width = sensor_get_pulse_width();
-                    distance_cm = pulse_width / 116;
-                    
-                    // Debug output
-                    DEBUG_PRINT("Distance: ");
-                    DEBUG_PRINT_NUM(distance_cm);
-                    DEBUG_PRINTLN(" cm");
-                    
-                    // Reset sensor for next measurement
-                    sensor_reset();
-                    sensor_triggered = 0;
-                    
-                    // Cat detection logic
-                    if (distance_cm > 0 && distance_cm < SENSOR_DETECTION_DISTANCE_CM)
+                    if (state == IDLE)
                     {
-                        // Check if cooldown period has expired
-                        if (get_elapsed_ticks(sensor_cooldown_start) >= SENSOR_COOLDOWN_TICKS)
-                        {
-                            if (state == IDLE)
-                            {
-                                DEBUG_PRINT("Cat detected at ");
-                                DEBUG_PRINT_NUM(distance_cm);
-                                DEBUG_PRINTLN(" cm");
-
-                                state = CAT_DETECTED;
-                                cat_detected_start = system_ticks;
-                            }
-                        }
-                        else
-                        {
-                            DEBUG_PRINTLN("Cooldown active, ignoring detection");
-                        }
-                    }
-                    else
-                    {
-                        // No cat detected or out of range
-                        if (state == CAT_DETECTED)
-                        {
-                            DEBUG_PRINTLN("Cat moved away");
-                            state = IDLE;
-                        }
+                        DEBUG_PRINT("Cat detected at ");
+                        DEBUG_PRINT_NUM(distance_cm);
+                        DEBUG_PRINTLN(" cm - confirming...");
+                        
+                        state = CAT_DETECTED;
+                        cat_detected_tick = system_ticks;
+                        // Timer0 ISR will trigger dispensing after 1 second
                     }
                 }
                 else
                 {
-                    DEBUG_PRINTLN("Sensor timeout");
-                    // Reset sensor for next measurement
-                    sensor_reset();
-                    sensor_triggered = 0;
-                    distance_cm = 0;
+                    DEBUG_PRINTLN("Cooldown active, ignoring");
+                }
+            }
+            else
+            {
+                // Cat moved away
+                if (state == CAT_DETECTED)
+                {
+                    DEBUG_PRINTLN("Cat moved away");
+                    state = IDLE;
                 }
             }
         }
-#endif // ENABLE_SENSOR_FEED
-
-        // ========== STATE MACHINE ==========
-        switch (state)
-        {
-        case IDLE:
-            // Do nothing, wait for triggers
-            break;
-
-        case CAT_DETECTED:
-#if ENABLE_SENSOR_FEED
-            // Wait 1 second to confirm cat presence
-            if (get_elapsed_ticks(cat_detected_start) >= 100)  // 100 ticks = 1 second
-            {
-                DEBUG_PRINTLN("Starting snack dispense...");
-                state = DISPENSING_SENSOR;
-                dispense_start = system_ticks;
-            }
 #endif
-            break;
 
-        case DISPENSING_SCHEDULED:
-            // Start motor if not already running
-            if (!motor_is_running()) {
-                motor_start_dispensing(SCHEDULED_DISPENSE_SECONDS * 1000);
-                DEBUG_PRINTLN("Motor started for scheduled feed");
-            }
-
-            // Check if dispensing is complete
-            if (get_elapsed_ticks(dispense_start) >= SCHEDULED_DISPENSE_TICKS) {
-                motor_stop();
+        // ========== MOTOR DISPENSE COMPLETE (from ISR callback) ==========
+        if (motor_dispense_complete)
+        {
+            motor_dispense_complete = 0;
+            
+            if (state == DISPENSING_SCHEDULED)
+            {
                 DEBUG_PRINTLN("Scheduled feed complete!");
                 state = IDLE;
-#if ENABLE_SENSOR_FEED
-                distance_cm = 0;
-#endif
             }
-            break;
-
-        case DISPENSING_SENSOR:
-            // Start motor if not already running
-            if (!motor_is_running()) {
-                motor_start_dispensing(SENSOR_DISPENSE_SECONDS * 1000);
-                DEBUG_PRINTLN("Motor started for snack dispense");
-            }
-
-            // Check if dispensing is complete
-            if (get_elapsed_ticks(dispense_start) >= SENSOR_DISPENSE_TICKS) {
-                motor_stop();
+            else if (state == DISPENSING_SENSOR)
+            {
                 DEBUG_PRINTLN("Snack complete! Cooldown active.");
-
                 state = IDLE;
-                sensor_cooldown_start = system_ticks;
-#if ENABLE_SENSOR_FEED
-                distance_cm = 0;
-#endif
+                sensor_cooldown_end_tick = system_ticks + SENSOR_COOLDOWN_TICKS;
             }
-            break;
+            
+            display_distance = 0;
         }
 
-        // ========== LCD UPDATE ==========
-        uint8_t is_cooldown_active = (get_elapsed_ticks(sensor_cooldown_start) < SENSOR_COOLDOWN_TICKS);
+        // ========== LCD UPDATE (only when state changes) ==========
+        uint8_t is_cooldown_active = (system_ticks < sensor_cooldown_end_tick);
 
         if (state != last_state || is_cooldown_active != last_cooldown_status)
         {
-#if ENABLE_SENSOR_FEED
-            lcd_display_state(state, distance_cm, is_cooldown_active);
-#else
-            lcd_display_state(state, 0, is_cooldown_active);
-#endif
+            lcd_display_state(state, display_distance, is_cooldown_active);
             last_state = state;
             last_cooldown_status = is_cooldown_active;
         }

@@ -21,6 +21,9 @@ volatile uint8_t current_step = 0;
 volatile uint16_t remaining_time_ms = 0;
 volatile uint8_t motor_running = 0;
 
+// External callback function (defined in main.c)
+extern void motor_dispense_complete_callback(void);
+
 // Timer2 Compare Match A - triggers every 2ms for motor stepping
 ISR(TIMER2_COMPA_vect) {
     if (motor_running && remaining_time_ms > 0) {
@@ -43,6 +46,7 @@ ISR(TIMER2_COMPA_vect) {
         // Stop motor when time expires
         if (remaining_time_ms == 0) {
             motor_stop();
+            motor_dispense_complete_callback();  // Notify main.c
         }
     }
 }
@@ -60,24 +64,19 @@ void motor_init(void) {
     // Setup Timer2 for motor stepping
     // CTC mode, prescaler 1024
     // OCR2A = 31 gives ~2ms per interrupt at 16MHz
-    // (16MHz / 1024) / 31 ≈ 500Hz ≈ 2ms period
-    TCCR2A = (1 << WGM21); // CTC mode
-    TCCR2B = (1 << CS22) | (1 << CS21) | (1 << CS20); // Prescaler 1024
-    OCR2A = 31; // Compare value for ~2ms
-    TIMSK2 = (1 << OCIE2A); // Enable compare match interrupt
+    TCCR2A = (1 << WGM21);
+    TCCR2B = (1 << CS22) | (1 << CS21) | (1 << CS20);
+    OCR2A = 31;
+    TIMSK2 = (1 << OCIE2A);
 }
 
 void motor_start_dispensing(uint16_t duration_ms) {
     current_step = 0;
     remaining_time_ms = duration_ms;
     motor_running = 1;
-    // Timer2 interrupt will handle the stepping
 }
 
 void motor_step_forward(void) {
-    // This function keeps the motor running
-    // The actual stepping is handled by the Timer2 ISR
-    // Just ensure motor_running flag is set
     if (!motor_running) {
         motor_running = 1;
     }
