@@ -1,5 +1,6 @@
 #include "uart.h"
 #include <avr/io.h>
+#include <stdio.h>
 
 void uart_init(uint32_t baud){
     uint16_t ubrr = (F_CPU/16/baud)-1;
